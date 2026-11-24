@@ -129,6 +129,7 @@ def send_checkin_to_all():
         except Exception as e:  # noqa: BLE001
             log.error("Не удалось отправить %s (%s): %s", name, phone, e)
     log.info("Отправлено: %d из %d", ok, len(students))
+    return ok, len(students)
 
 
 # ---------- Пересылка ответов учителю ----------
@@ -199,6 +200,45 @@ def incoming():
 @app.get("/")
 def health():
     return f"Бот работает. Учеников: {len(load_students())}"
+
+
+@app.get("/send")
+def send_now():
+    """Запустить рассылку из браузера: /send?key=<VERIFY_TOKEN>"""
+    if request.args.get("key") != VERIFY_TOKEN:
+        abort(403)
+    ok, total = send_checkin_to_all()
+    return f"Рассылка отправлена: {ok} из {total}"
+
+
+PRIVACY_HTML = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Политика конфиденциальности — Okurmen Academy</title>
+<style>body{font-family:system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;line-height:1.6;color:#222}</style>
+</head><body>
+<h1>Политика конфиденциальности</h1>
+<p>Okurmen Academy использует WhatsApp-бота, чтобы связываться со своими учениками
+и узнавать, как проходит их учёба.</p>
+<h2>Какие данные мы обрабатываем</h2>
+<ul>
+<li>Имя ученика и номер телефона WhatsApp, которые ученик сообщил учебному центру.</li>
+<li>Сообщения, которые ученик отправляет боту в ответ.</li>
+</ul>
+<h2>Зачем</h2>
+<p>Только для связи с учениками по вопросам обучения. Ответы учеников передаются их преподавателю.
+Мы не продаём и не передаём данные третьим лицам, кроме Meta (WhatsApp), через которую доставляются сообщения.</p>
+<h2>Хранение</h2>
+<p>Бот не хранит переписку в базе данных: сообщения пересылаются преподавателю и остаются в WhatsApp.</p>
+<h2>Как отказаться и удалить данные</h2>
+<p>Чтобы больше не получать сообщения или удалить свои данные, напишите об этом боту или преподавателю —
+номер будет удалён из списка рассылки.</p>
+<p>Контакт: """ + os.environ.get("CONTACT_EMAIL", "bsainaev@gmail.com") + """</p>
+</body></html>"""
+
+
+@app.get("/privacy")
+def privacy():
+    return PRIVACY_HTML
 
 
 # ---------- Запуск ----------
