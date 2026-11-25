@@ -5,8 +5,8 @@ WhatsApp-бот для учеников.
   1. По расписанию (по умолчанию Пн/Ср/Пт в 19:00) пишет каждому ученику
      из students.csv: «Привет, <имя>! Как идёт учёба? ...»
   2. Когда ученик отвечает — пересылает ответ учителю в WhatsApp.
-  3. Если задан ANTHROPIC_API_KEY — сам отвечает ученикам на вопросы по курсу
-     (через Claude) и присылает учителю копию вопроса и ответа.
+  3. Если задан GEMINI_API_KEY (бесплатно) или ANTHROPIC_API_KEY — сам отвечает
+     ученикам на вопросы по курсу и присылает учителю копию вопроса и ответа.
 
 Работает через официальный WhatsApp Cloud API (Meta).
 """
@@ -47,7 +47,9 @@ STUDENTS_FILE = os.environ.get("STUDENTS_FILE", "students.csv")
 
 # ---------- ИИ-помощник (Claude) ----------
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-AI_MODEL = os.environ.get("AI_MODEL", "claude-haiku-5-5")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()       # бесплатный ключ из Google AI Studio
+AI_ENABLED = bool(GEMINI_API_KEY or ANTHROPIC_API_KEY)
+AI_MODEL = os.environ.get("AI_MODEL") or ("gemini-flash-latest" if GEMINI_API_KEY else "claude-haiku-5-5")
 AI_DAILY_LIMIT = int(os.environ.get("AI_DAILY_LIMIT", "20"))   # ответов ИИ на ученика в день
 COURSE_INFO = os.environ.get(
     "COURSE_INFO",
@@ -220,12 +222,7 @@ def ai_allowed(phone: str) -> bool:
         return True
 
 
-def ask_ai(phone: str, name: str, text: str) -> str:
-    hist = _history[phone]
-    hist.append({"role": "user", "content": f"{name}: {text}"})
-    messages = list(hist)
-    while messages and messages[0]["role"] != "user":   # диалог должен начинаться с ученика
-        messages.pop(0)
+def _claude(messages: list) -> str:
     r = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -238,9 +235,45 @@ def ask_ai(phone: str, name: str, text: str) -> str:
     )
     data = r.json()
     if r.status_code != 200:
-        hist.pop()
         raise RuntimeError(data)
-    answer = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+    return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+
+
+def _gemini(messages: list) -> str:
+    r = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{AI_MODEL}:generateContent",
+        headers={"x-goog-api-key": GEMINI_API_KEY, "content-type": "application/json"},
+        json={
+            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+            "contents": [
+                {"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]}
+                for m in messages
+            ],
+            "generationConfig": {"maxOutputTokens": 2048},
+        },
+        timeout=60,
+    )
+    data = r.json()
+    if r.status_code != 200:
+        raise RuntimeError(data)
+    parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts", [])
+    return "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+
+
+def ask_ai(phone: str, name: str, text: str) -> str:
+    hist = _history[phone]
+    hist.append({"role": "user", "content": f"{name}: {text}"})
+    messages = list(hist)
+    while messages and messages[0]["role"] != "user":   # диалог должен начинаться с ученика
+        messages.pop(0)
+    try:
+        answer = _gemini(messages) if GEMINI_API_KEY else _claude(messages)
+    except Exception:
+        hist.pop()
+        raise
+    if not answer:
+        hist.pop()
+        raise RuntimeError("пустой ответ ИИ")
     hist.append({"role": "assistant", "content": answer})
     return answer[:3500]
 
@@ -249,7 +282,7 @@ def handle_student_message(phone: str, name: str, msg: dict):
     text = describe_message(msg)
     log.info("Сообщение от %s: %s", name, text)
 
-    if not ANTHROPIC_API_KEY:
+    if not AI_ENABLED:
         forward_to_teacher(name, phone, text)
         return
 
@@ -374,7 +407,7 @@ else:
     )
     log.info("Расписание: %s в %02d:%02d (%s)", SEND_DAYS, SEND_HOUR, SEND_MINUTE, TIMEZONE)
 scheduler.start()
-log.info("ИИ-ответы: %s", "включены (" + AI_MODEL + ")" if ANTHROPIC_API_KEY else "выключены")
+log.info("ИИ-ответы: %s", "включены (" + AI_MODEL + ")" if AI_ENABLED else "выключены")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
