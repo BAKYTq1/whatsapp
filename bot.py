@@ -5,6 +5,8 @@ WhatsApp-бот для учеников.
   1. По расписанию (по умолчанию Пн/Ср/Пт в 19:00) пишет каждому ученику
      из students.csv: «Привет, <имя>! Как идёт учёба? ...»
   2. Когда ученик отвечает — пересылает ответ учителю в WhatsApp.
+  3. Если задан ANTHROPIC_API_KEY — сам отвечает ученикам на вопросы по курсу
+     (через Claude) и присылает учителю копию вопроса и ответа.
 
 Работает через официальный WhatsApp Cloud API (Meta).
 """
@@ -13,6 +15,9 @@ import csv
 import logging
 import os
 import re
+import threading
+import time
+from collections import OrderedDict, defaultdict, deque
 
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -39,6 +44,28 @@ SEND_MINUTE = int(os.environ.get("SEND_MINUTE", "0"))
 TIMEZONE = os.environ.get("TIMEZONE", "Asia/Bishkek")
 
 STUDENTS_FILE = os.environ.get("STUDENTS_FILE", "students.csv")
+
+# ---------- ИИ-помощник (Claude) ----------
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+AI_MODEL = os.environ.get("AI_MODEL", "claude-haiku-5-5")
+AI_DAILY_LIMIT = int(os.environ.get("AI_DAILY_LIMIT", "20"))   # ответов ИИ на ученика в день
+COURSE_INFO = os.environ.get(
+    "COURSE_INFO",
+    "Курс программирования в Okurmen Academy: HTML, CSS, JavaScript, Git, основы веб-разработки.",
+)
+SYSTEM_PROMPT = f"""Ты — помощник преподавателя в учебном центре Okurmen Academy. Ты общаешься с учениками в WhatsApp.
+
+О курсе: {COURSE_INFO}
+
+Правила:
+- Отвечай на том языке, на котором пишет ученик (кыргызский или русский). Если непонятно — по-кыргызски.
+- Отвечай коротко и просто, как хороший учитель новичку: обычно 2–6 предложений. Это WhatsApp, длинных статей не пиши.
+- Код показывай короткими кусками. Заголовки и таблицы Markdown не используй: WhatsApp их не показывает. Можно *жирный* и ```код```.
+- Объясняй и наводи на решение, а не делай домашнее задание целиком за ученика.
+- Если ученик просто рассказывает, как дела («жакшы», «всё хорошо»), коротко и тепло ответь и предложи задать вопрос, если он есть.
+- Если вопрос не про учёбу и не про программирование — вежливо скажи, что помогаешь только по курсу.
+- Если не уверен в ответе, или вопрос про оценки, оплату, расписание, пропуски или личную проблему — не выдумывай: скажи, что передашь вопрос преподавателю и он ответит сам.
+- Никогда не выдумывай факты о курсе, датах и ценах."""
 API_URL = f"https://graph.facebook.com/v23.0/{PHONE_NUMBER_ID}/messages"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -164,6 +191,94 @@ def describe_message(msg: dict) -> str:
     }.get(t, f"[{t}]")
 
 
+# ---------- ИИ-ответы ----------
+_history = defaultdict(lambda: deque(maxlen=10))   # последние сообщения диалога с каждым учеником
+_daily = {}                                        # {телефон: (дата, сколько ответов)}
+_seen = OrderedDict()                              # id уже обработанных сообщений (WhatsApp может прислать повтор)
+_lock = threading.Lock()
+
+
+def already_seen(msg_id: str) -> bool:
+    with _lock:
+        if not msg_id or msg_id in _seen:
+            return bool(msg_id)
+        _seen[msg_id] = True
+        while len(_seen) > 2000:
+            _seen.popitem(last=False)
+        return False
+
+
+def ai_allowed(phone: str) -> bool:
+    today = time.strftime("%Y-%m-%d")
+    with _lock:
+        day, count = _daily.get(phone, (today, 0))
+        if day != today:
+            count = 0
+        if count >= AI_DAILY_LIMIT:
+            return False
+        _daily[phone] = (today, count + 1)
+        return True
+
+
+def ask_ai(phone: str, name: str, text: str) -> str:
+    hist = _history[phone]
+    hist.append({"role": "user", "content": f"{name}: {text}"})
+    messages = list(hist)
+    while messages and messages[0]["role"] != "user":   # диалог должен начинаться с ученика
+        messages.pop(0)
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={"model": AI_MODEL, "max_tokens": 700, "system": SYSTEM_PROMPT, "messages": messages},
+        timeout=60,
+    )
+    data = r.json()
+    if r.status_code != 200:
+        hist.pop()
+        raise RuntimeError(data)
+    answer = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+    hist.append({"role": "assistant", "content": answer})
+    return answer[:3500]
+
+
+def handle_student_message(phone: str, name: str, msg: dict):
+    text = describe_message(msg)
+    log.info("Сообщение от %s: %s", name, text)
+
+    if not ANTHROPIC_API_KEY:
+        forward_to_teacher(name, phone, text)
+        return
+
+    if msg.get("type") != "text":
+        send_text(phone, "Азырынча текст гана окуй алам 🙏 Суроону жазып жибериңизчи.\n"
+                         "(Пока я понимаю только текст — напишите вопрос, пожалуйста.)")
+        forward_to_teacher(name, phone, text)
+        return
+
+    if not ai_allowed(phone):
+        forward_to_teacher(name, phone, text + "\n\n(лимит ответов бота на сегодня исчерпан — ответьте сами)")
+        return
+
+    try:
+        answer = ask_ai(phone, name, text)
+        send_text(phone, answer)
+        forward_to_teacher(name, phone, f"{text}\n\n🤖 Бот ответил:\n{answer}")
+    except Exception as e:  # noqa: BLE001
+        log.error("Ошибка ИИ для %s: %s", name, e)
+        forward_to_teacher(name, phone, text + "\n\n(бот не смог ответить — ответьте сами)")
+
+
+def safe(fn, *args):
+    try:
+        fn(*args)
+    except Exception as e:  # noqa: BLE001
+        log.error("Ошибка обработки: %s", e)
+
+
 # ---------- Webhook (сюда WhatsApp присылает ответы) ----------
 @app.get("/webhook")
 def verify():
@@ -187,13 +302,20 @@ def incoming():
                         send_checkin_to_all()
                         send_text(TEACHER_PHONE, "✅ Рассылка отправлена")
                     continue
-                name = students.get(phone, "Неизвестный номер")
-                text = describe_message(msg)
-                log.info("Ответ от %s: %s", name, text)
-                try:
-                    forward_to_teacher(name, phone, text)
-                except Exception as e:  # noqa: BLE001
-                    log.error("Не удалось переслать учителю: %s", e)
+                if already_seen(msg.get("id", "")):
+                    continue
+                if phone in students:
+                    # Отвечаем в фоне, чтобы WhatsApp сразу получил «ok» и не слал повторы
+                    threading.Thread(
+                        target=safe, args=(handle_student_message, phone, students[phone], msg), daemon=True
+                    ).start()
+                else:
+                    # Незнакомым номерам ИИ не отвечает — только пересылаем вам
+                    threading.Thread(
+                        target=safe,
+                        args=(forward_to_teacher, "Неизвестный номер", phone, describe_message(msg)),
+                        daemon=True,
+                    ).start()
     return "ok"
 
 
@@ -243,12 +365,16 @@ def privacy():
 
 # ---------- Запуск ----------
 scheduler = BackgroundScheduler(timezone=TIMEZONE)
-scheduler.add_job(
-    send_checkin_to_all,
-    CronTrigger(day_of_week=SEND_DAYS, hour=SEND_HOUR, minute=SEND_MINUTE, timezone=TIMEZONE),
-)
+if SEND_DAYS.strip().lower() in ("", "none", "off"):
+    log.info("Встроенное расписание выключено (рассылку запускает /send)")
+else:
+    scheduler.add_job(
+        send_checkin_to_all,
+        CronTrigger(day_of_week=SEND_DAYS, hour=SEND_HOUR, minute=SEND_MINUTE, timezone=TIMEZONE),
+    )
+    log.info("Расписание: %s в %02d:%02d (%s)", SEND_DAYS, SEND_HOUR, SEND_MINUTE, TIMEZONE)
 scheduler.start()
-log.info("Расписание: %s в %02d:%02d (%s)", SEND_DAYS, SEND_HOUR, SEND_MINUTE, TIMEZONE)
+log.info("ИИ-ответы: %s", "включены (" + AI_MODEL + ")" if ANTHROPIC_API_KEY else "выключены")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
