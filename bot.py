@@ -25,6 +25,8 @@ from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 from flask import Flask, abort, request
 
+from faq import find_answer
+
 load_dotenv()
 
 # ---------- Настройки (берутся из файла .env) ----------
@@ -49,6 +51,9 @@ STUDENTS_FILE = os.environ.get("STUDENTS_FILE", "students.csv")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()       # бесплатный ключ из Google AI Studio
 AI_ENABLED = bool(GEMINI_API_KEY or ANTHROPIC_API_KEY)
+# Режим ответов ученикам: "rules" — только if/else из faq.py, "ai" — ИИ (а если он сломался — if/else),
+# "off" — бот не отвечает, только пересылает вам. По умолчанию: ai, если есть ключ, иначе rules.
+REPLY_MODE = (os.environ.get("REPLY_MODE") or ("ai" if AI_ENABLED else "rules")).strip().lower()
 AI_MODEL = os.environ.get("AI_MODEL") or ("gemini-flash-latest" if GEMINI_API_KEY else "claude-haiku-5-5")
 AI_DAILY_LIMIT = int(os.environ.get("AI_DAILY_LIMIT", "20"))   # ответов ИИ на ученика в день
 COURSE_INFO = os.environ.get(
@@ -282,7 +287,7 @@ def handle_student_message(phone: str, name: str, msg: dict):
     text = describe_message(msg)
     log.info("Сообщение от %s: %s", name, text)
 
-    if not AI_ENABLED:
+    if REPLY_MODE == "off":
         forward_to_teacher(name, phone, text)
         return
 
@@ -296,13 +301,19 @@ def handle_student_message(phone: str, name: str, msg: dict):
         forward_to_teacher(name, phone, text + "\n\n(лимит ответов бота на сегодня исчерпан — ответьте сами)")
         return
 
-    try:
-        answer = ask_ai(phone, name, text)
-        send_text(phone, answer)
-        forward_to_teacher(name, phone, f"{text}\n\n🤖 Бот ответил:\n{answer}")
-    except Exception as e:  # noqa: BLE001
-        log.error("Ошибка ИИ для %s: %s", name, e)
-        forward_to_teacher(name, phone, text + "\n\n(бот не смог ответить — ответьте сами)")
+    answer, source, need_teacher = None, "", False
+    if REPLY_MODE == "ai" and AI_ENABLED:
+        try:
+            answer, source = ask_ai(phone, name, text), "🤖 ИИ ответил"
+        except Exception as e:  # noqa: BLE001
+            log.error("Ошибка ИИ для %s: %s — отвечаю по правилам", name, e)
+    if answer is None:
+        answer, need_teacher = find_answer(text)
+        source = "📋 Бот ответил по шаблону"
+
+    send_text(phone, answer)
+    note = "\n\n❗ Нужен ваш ответ" if need_teacher else ""
+    forward_to_teacher(name, phone, f"{text}\n\n{source}:\n{answer}{note}")
 
 
 def safe(fn, *args):
@@ -417,7 +428,7 @@ else:
     )
     log.info("Расписание: %s в %02d:%02d (%s)", SEND_DAYS, SEND_HOUR, SEND_MINUTE, TIMEZONE)
 scheduler.start()
-log.info("ИИ-ответы: %s", "включены (" + AI_MODEL + ")" if AI_ENABLED else "выключены")
+log.info("Режим ответов: %s%s", REPLY_MODE, f" ({AI_MODEL})" if REPLY_MODE == "ai" and AI_ENABLED else "")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
