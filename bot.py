@@ -11,6 +11,8 @@ WhatsApp-бот для учеников.
 Работает через официальный WhatsApp Cloud API (Meta).
 """
 
+
+
 import csv
 import logging
 import os
@@ -411,3 +413,15 @@ log.info("ИИ-ответы: %s", "включены (" + AI_MODEL + ")" if AI_EN
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
+
+
+
+
+
+
+
+
+
+
+    
